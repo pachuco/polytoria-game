@@ -20,6 +20,71 @@ namespace Polytoria.Datamodel;
 [Instantiable]
 public sealed partial class Sound : Dynamic
 {
+	private sealed class AudioAssetLoader {
+		private NetworkedObject parentObject;
+		private AudioAsset? curAsset;
+		private Resource? loadedResource;
+		
+		public AudioAssetLoader(NetworkedObject parent) {
+			parentObject = parent;
+		}
+		
+		public void LoadFromAsset(AudioAsset? newAsset, Action<AudioAssetLoader> callback) {
+			void f(Resource resource) {
+				// Prevent the same resource firing twice
+				if (resource == loadedResource) return;
+				loadedResource = resource;
+				callback(this);
+			}
+			
+			if (curAsset != null && curAsset != newAsset)
+			{
+				curAsset.ResourceLoaded -= f;
+				curAsset.UnlinkFrom(parentObject);
+			}
+			curAsset = newAsset;
+			loadedResource = null;
+
+			if (curAsset != null)
+			{
+				curAsset.LinkTo(parentObject);
+				curAsset.ResourceLoaded += f;
+
+				if (curAsset.IsResourceLoaded && curAsset.Resource != null)
+				{
+					f(curAsset.Resource);
+				}
+				else
+				{
+					curAsset.QueueLoadResource();
+				}
+			}
+		}
+		
+		public void LoadFromID(int soundID, Action<AudioAssetLoader> callback) {
+			PTAudioAsset audioAsset = new() { Name = "AudioAsset" };
+			
+			audioAsset.AudioID = (uint)soundID;
+			LoadFromAsset(audioAsset, callback);
+		}
+		
+		public AudioStream? GetStream() {
+			return (AudioStream?)curAsset?.Resource;
+		}
+		
+		public AudioAsset? GetAsset() {
+			return curAsset;
+		}
+		
+		public int GetID() {
+			if (curAsset is PTAudioAsset ptAsset) {
+				return (int)ptAsset.AudioID;
+			} else {
+				return 0; // WARN : is this right?
+			}
+		}
+	}
+	
 	public const float SoundDistanceMultipler = 1.25f;
 	private const float MinPitch = 1.17549435E-38f; // smallest float above denormals
 	private const float MaxVolume = 2f;
@@ -27,12 +92,9 @@ public sealed partial class Sound : Dynamic
 	private AudioStreamPlayer3D? _audioPlayer3D;
 	private bool _playAfterLoad = false;
 	private bool _serverIsPlaying = false;
-	private Resource? _prevAsset;
 	private string _audioBusName = "Master";
 	private AudioEffectPanner? _efPanner;
 
-	private AudioAsset? _asset;
-	private int _soundID = 0;
 	private bool _autoplay = false;
 	private float _volume = 1f;
 	private float _time = 0f;
@@ -45,6 +107,11 @@ public sealed partial class Sound : Dynamic
 	private float _pan = 0f;
 
 	private AudioStream? _currentStream;
+	private AudioAsset? _asset;
+	private int _currentID;
+	
+	private AudioAssetLoader? _loader;
+
 
 	[Editable, ScriptProperty]
 	public AudioAsset? Audio
@@ -52,32 +119,7 @@ public sealed partial class Sound : Dynamic
 		get => _asset;
 		set
 		{
-			if (_asset != null && _asset != value)
-			{
-				_asset.ResourceLoaded -= OnResourceLoaded;
-				_asset.UnlinkFrom(this);
-			}
-			_asset = value;
-
-			_audioPlayer?.Stream = null;
-			_audioPlayer3D?.Stream = null;
-			_prevAsset = null;
-
-			if (_asset != null)
-			{
-				Loading = true;
-				_asset.LinkTo(this);
-				_asset.ResourceLoaded += OnResourceLoaded;
-
-				if (_asset.IsResourceLoaded && _asset.Resource != null)
-				{
-					OnResourceLoaded(_asset.Resource);
-				}
-				else
-				{
-					_asset.QueueLoadResource();
-				}
-			}
+			_loader.LoadFromAsset(value, OnResourceLoaded);
 			OnPropertyChanged();
 		}
 	}
@@ -85,11 +127,11 @@ public sealed partial class Sound : Dynamic
 	[Editable, ScriptProperty, NoSync, Attributes.Obsolete("Use Audio instead"), CloneIgnore]
 	public int SoundID
 	{
-		get => _soundID;
+		get => _currentID;
 		set
 		{
-			_soundID = value;
-			CreatePTAudioAsset();
+			_loader.LoadFromID(value, OnResourceLoaded);
+			
 			OnPropertyChanged();
 		}
 	}
@@ -284,6 +326,8 @@ public sealed partial class Sound : Dynamic
 
 	public override void Init()
 	{
+		_loader = new(this);
+		
 		CreateAudioPlayer();
 #if CREATOR
 		GDNode.AddChild(new SpatialIcon(ClassName), @internal: Node.InternalMode.Back);
@@ -377,17 +421,6 @@ public sealed partial class Sound : Dynamic
 	{
 		// Pan does not apply to in-world sounds
 		_efPanner?.Pan = _pan;
-	}
-
-	private void CreatePTAudioAsset()
-	{
-		Loading = true;
-		PTAudioAsset audioAsset = new()
-		{
-			Name = "AudioAsset"
-		};
-		Audio = audioAsset;
-		audioAsset.AudioID = (uint)_soundID;
 	}
 
 	private void OnPlayerFinished()
@@ -568,16 +601,15 @@ public sealed partial class Sound : Dynamic
 		_audioPlayer?.Seek(to);
 		_audioPlayer3D?.Seek(to);
 	}
-
-	private void OnResourceLoaded(Resource audio)
+	
+	private void OnResourceLoaded(AudioAssetLoader loader)
 	{
-		// Prevent the same resource firing twice
-		if (audio == _prevAsset) return;
-		_prevAsset = audio;
 		Loading = false;
-		_currentStream = (AudioStream)audio;
-		_audioPlayer?.Stream = (AudioStream)audio;
-		_audioPlayer3D?.Stream = (AudioStream)audio;
+		_currentStream = loader.GetStream();
+		_audioPlayer?.Stream = loader.GetStream();
+		_audioPlayer3D?.Stream = loader.GetStream();
+		_asset = loader.GetAsset();
+		_currentID = loader.GetID();
 		// reapply to new stream
 		LoopStart = _loopStart;
 		Loop = _loop;
